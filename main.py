@@ -1,21 +1,19 @@
 # This file is ugly and needs to be split and organized ;w;
 
 import asyncio
+from contextlib import asynccontextmanager
 import json
 import os
-from re import A
-from webbrowser import get
+import logging
+import sys
 from dotenv import load_dotenv
-from sanic import Sanic, Websocket, Request
-from sanic.response import json as jsonify
-from sanic.log import logger
+from fastapi import FastAPI, Request, WebSocket
 from twitchAPI.twitch import Twitch
-from twitchAPI.oauth import UserAuthenticationStorageHelper, UserAuthenticator
+from twitchAPI.oauth import  UserAuthenticator
 from twitchAPI.type import (
     AuthScope,
     AuthType,
     TwitchAPIException,
-    EventSubSubscriptionTimeout,
 )
 from twitchAPI.eventsub.webhook import EventSubWebhook
 from twitchAPI.object.eventsub import ChannelPointsCustomRewardRedemptionAddEvent
@@ -41,11 +39,37 @@ TARGET_SCOPE = [
     AuthScope.CHANNEL_MANAGE_REDEMPTIONS,
 ]
 
-app = Sanic("twitch-webhook")
+logger = logging.getLogger("uvicorn.error")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await twitch_setup()
+
+    yield
+
+    await close_twitch()
+
+app = FastAPI(lifespan=lifespan)
 twitch: Twitch
 auth: UserAuthenticator
 eventsub: EventSubWebhook
 
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: list[WebSocket] = []
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
+
+    def disconnect(self, websocket: WebSocket):
+        self.active_connections.remove(websocket)
+
+    async def broadcast(self, message: str):
+        for connection in self.active_connections:
+            await connection.send_text(message)
+
+manager = ConnectionManager()
 
 def get_url(path: str):
     if APP_PORT:
@@ -55,66 +79,66 @@ def get_url(path: str):
 
 @app.get("/")
 async def get_status(request: Request):
-    return jsonify(
-        {
+    global twitch
+    return {
             "success": True,
             "message": "Server is running",
             "twitch": twitch.has_required_auth(AuthType.USER, TARGET_SCOPE),
             "login_url": get_url("/login"),
             "logout_url": get_url("/logout"),
+            "eventsub_url": EVENTSUB_URL,
+            "eventsub_port": EVENTSUB_PORT,
+            "eventsub_username": EVENTSUB_USERNAME
         }
-    )
+    
 
 
 @app.get("/login")
 async def login(request: Request):
     global twitch, auth
     if twitch.get_user_auth_token() is not None:
-        return jsonify(
-            {
+        return {
                 "success": True,
                 "message": "Already authenticated",
                 "logout_url": get_url("/logout"),
             }
-        )
-    return jsonify(
-        {
+        
+    return {
             "success": True,
             "message": "Please visit the following URL to authenticate",
             "url": auth.return_auth_url(),
         }
-    )
 
 
 @app.get("/login/callback")
 async def login_callback(request: Request):
-    global token, refresh
+    global token, refresh, eventsub
 
-    state = request.args.get("state")
+    state = request.query_params.get("state")
     if state != auth.state:
-        return jsonify({"success": False, "error": "Invalid state"})
+        return {"success": False, "error": "Invalid state"}
 
-    code = request.args.get("code")
+    code = request.query_params.get("code")
     if code is None:
-        return jsonify({"success": False, "error": "No code provided"})
+        return {"success": False, "error": "No code provided"}
 
     try:
         result = await auth.authenticate(user_token=code)
         if result is None:
-            return jsonify({"success": False, "error": "Failed to authenticate"})
+            return {"success": False, "error": "Failed to authenticate"}
 
         token, refresh = result
 
         await twitch.set_user_authentication(token, TARGET_SCOPE, refresh)
     except TwitchAPIException as e:
         logger.error(f"Failed to authenticate: {e}")
-        return jsonify({"success": False, "error": "Failed to authenticate"})
+        return {"success": False, "error": "Failed to authenticate"}
 
     with open("user_token.json", "w") as f:
         json.dump({"token": token, "refresh": refresh}, f)
 
     logger.info("Authenticated with Twitch")
-    return jsonify({"success": True, "message": "You may now close this window"})
+    return {"success": True, "message": "You may now close this window"}
 
 
 @app.get("/logout")
@@ -127,31 +151,27 @@ async def logout(request: Request):
     await twitch_setup(app)  # type: ignore
 
     logger.info("Logged out")
-    return jsonify(dict(success=True, message="Logged out"))
+    return dict(success=True, message="Logged out")
 
 
 @app.websocket("/ws")
-async def websocket(request: Request, ws: Websocket):
+async def websocket(ws: WebSocket):
+    await manager.connect(ws)
     while True:
-        await ws.send("Hello, World!")
-        data = await ws.recv()
-        if data == "close":
-            break
-
-        return
+        data = await ws.receive_text()
+        await ws.send_text(f"Message text was: {data}")
 
 
-@app.before_server_stop
-async def close_twitch(app: Sanic, loop):
+async def close_twitch():
     global twitch, eventsub
     await twitch.close()
-    await eventsub.stop()
 
 
 async def on_redeem(data: ChannelPointsCustomRewardRedemptionAddEvent):
     logger.debug(
         f"Redeemed {data.event.reward.title} by {data.event.user_name} with message {data.event.user_input}"
     )
+    await manager.broadcast(f"Redeemed {data.event.reward.title} by {data.event.user_name} with message {data.event.user_input}")
 
 
 async def refresh_callback(token, refresh):
@@ -160,11 +180,8 @@ async def refresh_callback(token, refresh):
         json.dump({"token": token, "refresh": refresh}, f)
     return
 
-
-@app.after_server_start
-async def twitch_setup(app: Sanic):
+async def twitch_setup():
     global twitch, auth
-
     if TWITCH_APP_ID is None or TWITCH_APP_SECRET is None:
         logger.error(
             "Please set TWITCH_APP_ID and TWITCH_APP_SECRET environment variables"
@@ -205,7 +222,7 @@ async def eventsub_setup():
         return
 
     eventsub = EventSubWebhook(
-        EVENTSUB_URL, EVENTSUB_PORT, twitch, callback_loop=asyncio.get_event_loop()
+        EVENTSUB_URL, EVENTSUB_PORT, twitch
     )
 
     user = await first(twitch.get_users(logins=[EVENTSUB_USERNAME]))

@@ -1,3 +1,4 @@
 twitchAPI
-sanic
 python-dotenv
+fastapi
+uvicorn
